@@ -1,0 +1,13 @@
+services:
+  doa-backend:
+    build: .
+    image: doa-backend:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - doa-data:/data
+    environment:
+      DOA_DATA_DIR: /data
+
+volumes:
+  doa-data:
