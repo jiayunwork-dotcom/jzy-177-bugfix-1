@@ -25,7 +25,7 @@
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                 # 47 项测试，逐条核对验收关系
+python -m pytest                 # 62 项测试，逐条核对验收关系
 uvicorn app.api.main:app --port 8000
 # 或：python -m app
 ```
@@ -71,7 +71,20 @@ POST /sessions
 ```
 
 指数遗忘因子：`"update": {"method": "forgetting", "alpha": 0.9922}`
-（`0.9922 = (256-1)/(256+1)`，与 W=256 等效记忆）。
+（`0.9922 = (256-1)/(256+1)`，与 W=256 等效记忆）。遗忘按**快拍**
+逐条加权：最新一条权重 1，每往前一条乘 α，结果与分包方式无关，
+整批送和切批送完全一致。
+
+会话状态（`GET /sessions/{id}` 与列表）带 `update_rule` /
+`update_frozen` 两个字段，标明该会话当前按哪种口径累积：
+
+* `sliding-window-v1`：定长滑动窗口；
+* `forgetting-snapshot-v2`：按快拍遗忘（现行定义）；
+* `forgetting-batch-v1`：按批遗忘（2026-10 修复前的旧口径）。
+  升级前落盘的遗忘会话按此口径识别并**冻结为只读**：历史状态与
+  结果保留可读、可继续出估计，但不再接受新的快拍追加
+  （`POST /batches` 回 `409 session_frozen`），请新建会话继续推送。
+  背景与候选方案取舍见 [`docs/design.md`](docs/design.md) §12。
 
 追加示例（实部虚部各为 M×K 嵌套数组；每批大小不固定，K≤10000）：
 
@@ -89,6 +102,7 @@ POST /sessions/{id}/batches
 {
   "version": 3,
   "total_snapshots": 600,
+  "update_rule": "sliding-window-v1",
   "config_used": {"source_mode": 2, "step_deg": 0.5, "...": "..."},
   "result": {
     "n_sources": 2,
@@ -148,7 +162,8 @@ POST /synthesize
 
 ```
 config.json    # 阵列/更新/估计配置与元数据（原子覆盖写）
-state.npz      # C、有效快拍数、窗口内快拍、已计入批次号（os.replace 原子落盘）
+state.npz      # C、有效快拍数、窗口内快拍、已计入批次号、累积口径
+               # 标记 rule（os.replace 原子落盘）
 results.jsonl  # 每次估计一行，version 从 1 单调递增（只追加，fsync）
 ```
 
@@ -161,17 +176,21 @@ results.jsonl  # 每次估计一行，version 从 1 单调递增（只追加，f
 [`experiments/tracking_experiment.py`](experiments/tracking_experiment.py)
 （可复跑，结果 JSON 在 `experiments/results/`）。**默认定长滑动窗口
 W=256**：阶跃后约 0.56W（≈144 条快拍）跟上，稳态 RMSE 约 0.024°，且
-跟拍速度与阶跃前历史长度无关；遗忘因子省内存、稳态精度略好，但旧数据
-几何拖尾，长时间运行后阶跃跟拍要 ~4.6W。两种方式都完整支持。
+跟拍速度与阶跃前历史长度无关；遗忘因子（按快拍逐条加权）省内存、
+跟拍延迟略低（约 0.38–0.50W），但旧数据几何拖尾永不真正归零，且等
+效记忆下有效快拍数只有窗口条数的一半。两种方式都完整支持。
 
 ## 测试
 
 ```bash
-python -m pytest -q          # 47 passed
+python -m pytest -q          # 62 passed
 ```
 
 统计类用例全部固定随机种子，覆盖：高 SNR 偏差 <0.1°、复标量不变性、
 栅瓣角度对、方位变号、相干源平滑前后对比、SNR 0→20 dB 的 RMSE 与
 3×CRB、高 SNR 下 MDL 源数、整批/分批估计一致、增量协方差对一次性定义
-的 1e-12 对齐与长程厄米性、批次幂等、并发串行等价、会话隔离、重启
-恢复、版本轮询、SSE 推送、全部人读错误与规模上限。
+的 1e-12 对齐与长程厄米性、遗忘因子整批/每包 16 条/逐条三种推法的
+角度·有效快拍数·CRB 比值一致且与外部 NumPy 参考吻合、极端参数
+（α=0.5、单批一万条）不出 NaN、升级前格式数据目录真实启动后旧会话
+列出·历史结果逐字保留·冻结只读·追加 409、批次幂等、并发串行等价、
+会话隔离、重启恢复、版本轮询、SSE 推送、全部人读错误与规模上限。

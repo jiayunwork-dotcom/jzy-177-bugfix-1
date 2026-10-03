@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from app.doa.covariance import (
+    RULE_FORGETTING_BATCH_V1,
+    RULE_FORGETTING_SNAPSHOT_V2,
+    RULE_SLIDING_V1,
     ForgettingAccumulator,
+    LegacyForgettingAccumulator,
     SlidingWindowAccumulator,
+    accumulator_from_state,
     batch_covariance,
     forgetting_covariance,
     hermitianize,
@@ -70,6 +76,109 @@ def test_forgetting_incremental_matches_one_shot():
     C_ref, n_ref = forgetting_covariance(batches, alpha)
     assert abs(acc.n_eff - n_ref) < n_ref * 1e-12
     assert np.allclose(acc.C, C_ref, rtol=RTOL, atol=1e-14)
+
+
+def test_forgetting_chunking_invariant_matches_numpy_definition():
+    """按快拍逐条遗忘的定义：整批/小批/逐条推入，与外部 NumPy 参考一致。
+
+    参考定义（与增量实现独立的直接计算）：第 t 条权重 alpha^(N-1-t)，
+    C = sum w_k x_k x_k^H / sum w_k。
+    """
+    rng = np.random.default_rng(21)
+    alpha = 0.98
+    X = (rng.standard_normal((M, 600)) +
+         1j * rng.standard_normal((M, 600))) / np.sqrt(2.0)
+    w = alpha ** np.arange(599, -1, -1, dtype=np.float64)
+    C_ref = (X * w) @ X.conj().T / w.sum()
+    n_ref = float(w.sum())
+
+    for chunk in (600, 16, 1, 7):  # 7 不整除 600，覆盖不整齐分包
+        acc = ForgettingAccumulator(M, alpha=alpha)
+        for lo in range(0, 600, chunk):
+            acc.add_batch(X[:, lo:lo + chunk])
+        scale = float(np.max(np.abs(C_ref)))
+        assert abs(acc.n_eff - n_ref) < n_ref * 1e-9
+        assert np.max(np.abs(acc.C - C_ref)) < scale * 1e-9
+        assert acc.total_snapshots == 600
+    # 一次性参考实现同样对齐该定义
+    C1, n1 = forgetting_covariance([X], alpha)
+    assert n1 == pytest.approx(n_ref, rel=1e-12)
+    assert np.allclose(C1, C_ref, rtol=RTOL, atol=1e-14)
+
+
+def test_forgetting_extreme_alpha_huge_batch_no_nan():
+    """alpha=0.5、单批 10000 条：alpha^K 下溢到 0 也不许出 NaN/除零。"""
+    rng = np.random.default_rng(22)
+    X = (rng.standard_normal((M, 10_000)) +
+         1j * rng.standard_normal((M, 10_000))) / np.sqrt(2.0)
+    acc = ForgettingAccumulator(M, alpha=0.5)
+    acc.add_batch(X)
+    assert np.all(np.isfinite(acc.C.real)) and np.all(np.isfinite(acc.C.imag))
+    assert np.isfinite(acc.n_eff) and acc.n_eff > 0.0
+    # 权重和 sum 0.5^k 收敛到 2
+    assert acc.n_eff == pytest.approx(2.0, rel=1e-12)
+    assert np.allclose(acc.C, acc.C.conj().T, atol=0.0)
+    # 极端状态下继续追加仍然正常
+    acc.add_batch(X[:, :5])
+    assert np.all(np.isfinite(acc.C.real))
+    assert acc.n_eff == pytest.approx(2.0, rel=1e-12)
+    assert acc.total_snapshots == 10_005
+
+
+def test_forgetting_alpha1_equals_plain_batch_covariance():
+    """alpha=1 时遗忘退化为增长平均：任意分包都与 XX^H/K 逐元素一致。"""
+    rng = np.random.default_rng(23)
+    X = (rng.standard_normal((M, 200)) +
+         1j * rng.standard_normal((M, 200))) / np.sqrt(2.0)
+    acc = ForgettingAccumulator(M, alpha=1.0)
+    for lo, hi in [(0, 23), (23, 100), (100, 200)]:
+        acc.add_batch(X[:, lo:hi])
+    C_ref, n_ref = batch_covariance(X)
+    assert acc.n_eff == n_ref
+    assert np.allclose(acc.C, C_ref, rtol=RTOL, atol=1e-14)
+
+
+def test_legacy_forgetting_state_loads_frozen():
+    """升级前落盘（无 rule 标记）的遗忘状态：加载为只读旧口径对象。"""
+    rng = np.random.default_rng(24)
+    X = (rng.standard_normal((M, 40)) +
+         1j * rng.standard_normal((M, 40))) / np.sqrt(2.0)
+    C0, _ = batch_covariance(X)
+    legacy_state = {  # 旧实现写出的字段，没有 "rule"
+        "kind": "forgetting", "m": M, "alpha": 0.97,
+        "C": C0, "n_eff": 40.0, "total_snapshots": 40,
+    }
+    acc = accumulator_from_state(legacy_state)
+    assert isinstance(acc, LegacyForgettingAccumulator)
+    assert acc.rule == RULE_FORGETTING_BATCH_V1
+    assert not acc.accepts_appends
+    assert acc.n_eff == 40.0 and acc.total_snapshots == 40
+    assert np.array_equal(acc.C, hermitianize(C0))
+    with pytest.raises(Exception, match="只读"):
+        acc.add_batch(X)
+    # 即使被再次序列化也固化 v1 标记，恢复后仍是只读旧口径
+    acc2 = accumulator_from_state(acc.to_state())
+    assert isinstance(acc2, LegacyForgettingAccumulator)
+    assert not acc2.accepts_appends
+
+
+def test_new_states_carry_rule_markers():
+    acc = SlidingWindowAccumulator(M, window=8)
+    assert acc.rule == RULE_SLIDING_V1
+    assert accumulator_from_state(acc.to_state()).rule == RULE_SLIDING_V1
+    facc = ForgettingAccumulator(M, alpha=0.9)
+    assert facc.rule == RULE_FORGETTING_SNAPSHOT_V2
+    assert accumulator_from_state(facc.to_state()).rule == \
+        RULE_FORGETTING_SNAPSHOT_V2
+    # 旧滑动窗口状态（无 rule）照常恢复、可继续追加
+    st = acc.to_state()
+    del st["rule"]
+    assert accumulator_from_state(st).accepts_appends
+    # 未知口径标记明确报错
+    bad = facc.to_state()
+    bad["rule"] = "forgetting-weird-v9"
+    with pytest.raises(Exception, match="口径"):
+        accumulator_from_state(bad)
 
 
 def test_forgetting_state_roundtrip_preserves_covariance():

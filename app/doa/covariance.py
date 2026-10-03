@@ -2,20 +2,33 @@
 
 两种增量更新器维护同一个语义量：
 
-* 样本协方差（MLE 归一化） ``C = (1/N) sum_k x_k x_k^H``；
-* 有效快拍数 ``N``。
+* 样本协方差（MLE 归一化） ``C = (1/N) sum_k w_k x_k x_k^H``；
+* 有效快拍数 ``N = sum_k w_k``。
 
-定长滑动窗口把窗口内全部 N 个快拍等权；指数遗忘因子令旧数据权重按
-alpha 指数衰减，``N`` 取权重和 ``sum alpha^k``。两种定义都给出一次性
-批处理参考实现 ``batch_covariance`` / ``forgetting_covariance``，
-增量结果与之逐元素对齐（见 tests/test_incremental.py）。
+定长滑动窗口把窗口内全部 N 个快拍等权（``w_k = 1``）；指数遗忘因子按
+**快拍**逐条加权：最新一条权重为 1，每往前一条乘 alpha，即第 t 条权重
+``alpha^(N-t)``。两种定义都给出一次性批处理参考实现
+``batch_covariance`` / ``forgetting_covariance``，增量结果与之逐元素
+对齐（见 tests/test_incremental.py），且与分包方式无关。
+
+每个更新器都带口径标记 ``rule`` 随状态落盘：``sliding-window-v1``、
+``forgetting-snapshot-v2``（按快拍遗忘，现行定义）。升级前落盘的遗忘
+因子状态没有该标记，是按**批**加权的旧口径，加载为只读的
+:class:`LegacyForgettingAccumulator`（``forgetting-batch-v1``）。
 """
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
+
+# 累积口径标记：随 state.npz 落盘，调用方可从会话状态读出当前按哪种
+# 规则累积。v1 遗忘（按批加权）只用于识别升级前的旧状态，不再能创建。
+RULE_SLIDING_V1 = "sliding-window-v1"
+RULE_FORGETTING_SNAPSHOT_V2 = "forgetting-snapshot-v2"
+RULE_FORGETTING_BATCH_V1 = "forgetting-batch-v1"
 
 
 class CovarianceError(ValueError):
@@ -56,29 +69,29 @@ def batch_covariance(X: np.ndarray) -> tuple[np.ndarray, int]:
 def forgetting_covariance(
     batches: list[np.ndarray], alpha: float
 ) -> tuple[np.ndarray, float]:
-    """按提交顺序、遗忘因子 alpha 一次性计算协方差。
+    """按快拍顺序、遗忘因子 alpha 一次性计算协方差。
 
-    最新批次权重为 1，再往前每批乘 alpha。归一化用权重和 N，与
-    :class:`ForgettingAccumulator` 的增量定义完全相同。
+    全部批次的快拍按提交顺序拼接，最新**一条**权重为 1，每往前一条乘
+    alpha（第 t 条权重 ``alpha^(N-1-t)``）。归一化用权重和
+    ``N = sum alpha^k``，与 :class:`ForgettingAccumulator` 的增量定义
+    完全相同（增量结果与分包方式无关）。
     """
     if not (0.0 < alpha <= 1.0):
         raise CovarianceError("遗忘因子必须满足 0 < alpha <= 1。")
     if not batches:
         raise CovarianceError("没有任何快拍。")
     m = np.asarray(batches[0]).shape[0]
-    acc = np.zeros((m, m), dtype=np.complex128)
-    weight_sum = 0.0
-    weight = 1.0
-    # 从最新批次向旧批次遍历
-    for X in reversed(batches):
-        X = check_snapshots(X, m)
-        k = X.shape[1]
-        acc += weight * (X @ X.conj().T)
-        weight_sum += weight * k
-        weight *= alpha
-    if weight_sum <= 0.0:
+    X = np.concatenate([check_snapshots(b, m) for b in batches], axis=1)
+    n = X.shape[1]
+    if n == 0:
+        raise CovarianceError("没有任何快拍。")
+    # 最新一条权重 1，逐条往前乘 alpha；很旧的快拍权重下溢到 0 是定义
+    # 允许的（其贡献本就为 0），不会产生 NaN。
+    w = alpha ** np.arange(n - 1, -1, -1, dtype=np.float64)
+    weight_sum = float(w.sum())
+    if weight_sum <= 0.0:  # pragma: no cover - 最新一条权重恒为 1
         raise CovarianceError("有效快拍权重为 0。")
-    return hermitianize(acc / weight_sum), weight_sum
+    return hermitianize(((X * w) @ X.conj().T) / weight_sum), weight_sum
 
 
 def forward_backward_smoothing(C: np.ndarray, sub_len: int) -> tuple[np.ndarray, int]:
@@ -108,6 +121,8 @@ class Accumulator:
     """增量协方差更新器基类。
 
     ``C`` 始终是厄米的样本协方差，``n_eff`` 为其分母（有效快拍数）。
+    ``rule`` 标识累积口径并随状态落盘；``accepts_appends`` 为 False
+    的更新器（旧口径只读状态）拒绝新的快拍追加。
     """
 
     m: int
@@ -115,8 +130,16 @@ class Accumulator:
     n_eff: float
     total_snapshots: int
 
+    # 旧口径只读状态（LegacyForgettingAccumulator）置 False
+    accepts_appends: ClassVar[bool] = True
+
     @property
     def kind(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def rule(self) -> str:
+        """累积口径标记（随状态落盘，会话状态里对调用方可见）。"""
         raise NotImplementedError
 
     def add_batch(self, X: np.ndarray) -> int:
@@ -160,6 +183,10 @@ class SlidingWindowAccumulator(Accumulator):
     def kind(self) -> str:
         return "sliding"
 
+    @property
+    def rule(self) -> str:
+        return RULE_SLIDING_V1
+
     def add_batch(self, X: np.ndarray) -> int:
         X = check_snapshots(X, self.m)
         k = X.shape[1]
@@ -185,6 +212,7 @@ class SlidingWindowAccumulator(Accumulator):
     def to_state(self) -> dict:
         return {
             "kind": "sliding",
+            "rule": self.rule,
             "m": self.m,
             "window": self.window,
             "C": self.C,
@@ -212,11 +240,25 @@ class SlidingWindowAccumulator(Accumulator):
 
 
 class ForgettingAccumulator(Accumulator):
-    """指数遗忘因子更新。
+    """指数遗忘因子更新（按快拍逐条加权，口径 v2）。
 
-    新批进入：``C <- (alpha * n_eff * C + X X^H) / (alpha*n_eff + K)``，
-    ``n_eff <- alpha*n_eff + K``。稳态下 ``n_eff -> K/(1-alpha)``（对
-    连续单条追加）。无需保留历史快拍。
+    定义：已累积 N 条快拍时第 t 条权重为 ``alpha^(N-t)``——最新一条
+    权重 1，每往前一条乘 alpha。一批 K 条进入时的递推：
+
+    * ``S <- alpha^K * S + sum_j alpha^(K-j) x_j x_j^H``（未归一化和，
+      由 ``C * n_eff`` 还原）；
+    * ``N <- alpha^K * N + sum_j alpha^(K-j)``；
+    * ``C = S / N``。
+
+    结果只取决于快拍序列本身，与分包方式无关：同一批快拍整批推、切
+    小批推、逐条推得到的 ``C`` 与 ``n_eff`` 相同（浮点 1e-12 量级，
+    见 tests/test_incremental.py），并与一次性参考
+    :func:`forgetting_covariance` 对齐。稳态 ``N -> 1/(1-alpha)``。
+    无需保留历史快拍，内存 O(M^2)。
+
+    ``alpha`` 很小或批很大时 ``alpha^K`` 会下溢到 0——这正确定义了
+    “旧数据权重为 0”，不会产生 NaN 或除零（最新一条权重恒为 1，
+    ``n_eff >= 1``）。
     """
 
     def __init__(self, m: int, alpha: float,
@@ -238,18 +280,30 @@ class ForgettingAccumulator(Accumulator):
     def kind(self) -> str:
         return "forgetting"
 
+    @property
+    def rule(self) -> str:
+        return RULE_FORGETTING_SNAPSHOT_V2
+
     def add_batch(self, X: np.ndarray) -> int:
         X = check_snapshots(X, self.m)
         k = X.shape[1]
-        new_sum = self.alpha * self.n_eff * self.C + X @ X.conj().T
-        self.n_eff = self.alpha * self.n_eff + k
-        self.C = hermitianize(new_sum / self.n_eff)
+        # 批内第 j 条（按到达顺序）权重 alpha^(k-j)：批内最新一条为 1，
+        # 每往前一条乘 alpha；旧未归一化和整体再乘 alpha^k。
+        w = self.alpha ** np.arange(k - 1, -1, -1, dtype=np.float64)
+        decay = self.alpha ** k
+        S = decay * (self.n_eff * self.C) + (X * w) @ X.conj().T
+        self.n_eff = decay * self.n_eff + float(w.sum())
         self.total_snapshots += k
+        if self.n_eff > 0.0:
+            self.C = hermitianize(S / self.n_eff)
+        else:  # pragma: no cover - 仅当 K=0 且此前无任何快拍
+            self.C = np.zeros((self.m, self.m), np.complex128)
         return k
 
     def to_state(self) -> dict:
         return {
             "kind": "forgetting",
+            "rule": self.rule,
             "m": self.m,
             "alpha": self.alpha,
             "C": self.C,
@@ -259,6 +313,69 @@ class ForgettingAccumulator(Accumulator):
 
     @classmethod
     def from_state(cls, state: dict) -> "ForgettingAccumulator":
+        return cls(
+            m=int(state["m"]),
+            alpha=float(state["alpha"]),
+            C=state["C"],
+            n_eff=float(state["n_eff"]),
+            total_snapshots=int(state["total_snapshots"]),
+        )
+
+
+class LegacyForgettingAccumulator(Accumulator):
+    """升级前按**批**遗忘口径（v1）的只读状态。
+
+    旧实现把遗忘作用在批上：每来一批，整批权重 1、旧和乘一次 alpha，
+    因此累积结果随分包方式变化，不是快拍序列的确定函数，也无法换算
+    成按快拍口径（服务从不保存遗忘方式下的原始快拍）。升级后这类
+    落盘状态被冻结：可读取、可继续在其协方差上出估计，但拒绝再追加
+    快拍（会话层在追加前检查 :attr:`accepts_appends` 并回 409）。
+    """
+
+    accepts_appends: ClassVar[bool] = False
+
+    def __init__(self, m: int, alpha: float,
+                 C: np.ndarray | None = None,
+                 n_eff: float = 0.0,
+                 total_snapshots: int = 0):
+        super().__init__(
+            m=m,
+            C=np.zeros((m, m), np.complex128) if C is None
+            else hermitianize(np.asarray(C, dtype=np.complex128)),
+            n_eff=float(n_eff),
+            total_snapshots=int(total_snapshots),
+        )
+        self.alpha = float(alpha)
+
+    @property
+    def kind(self) -> str:
+        return "forgetting"
+
+    @property
+    def rule(self) -> str:
+        return RULE_FORGETTING_BATCH_V1
+
+    def add_batch(self, X: np.ndarray) -> int:
+        raise CovarianceError(
+            "该会话是升级前按旧口径（按批遗忘 v1）累积的，已冻结为只读，"
+            "不能再追加快拍；请新建会话（按快拍遗忘 v2）继续推送数据。"
+        )
+
+    def to_state(self) -> dict:
+        # 冻结会话不会再落盘；保留完整序列化以便防御性拷贝，且口径标记
+        # 固化为 v1，即使被写出也永远按旧口径识别。
+        return {
+            "kind": "forgetting",
+            "rule": self.rule,
+            "m": self.m,
+            "alpha": self.alpha,
+            "C": self.C,
+            "n_eff": self.n_eff,
+            "total_snapshots": self.total_snapshots,
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "LegacyForgettingAccumulator":
         return cls(
             m=int(state["m"]),
             alpha=float(state["alpha"]),
@@ -282,5 +399,11 @@ def accumulator_from_state(state: dict) -> Accumulator:
     if state["kind"] == "sliding":
         return SlidingWindowAccumulator.from_state(state)
     if state["kind"] == "forgetting":
-        return ForgettingAccumulator.from_state(state)
+        # 升级前落盘的遗忘状态没有 rule 标记，按旧口径（按批 v1）识别
+        rule = state.get("rule", RULE_FORGETTING_BATCH_V1)
+        if rule == RULE_FORGETTING_SNAPSHOT_V2:
+            return ForgettingAccumulator.from_state(state)
+        if rule == RULE_FORGETTING_BATCH_V1:
+            return LegacyForgettingAccumulator.from_state(state)
+        raise CovarianceError(f"未知的遗忘因子口径标记：{rule!r}。")
     raise CovarianceError(f"未知的增量更新状态：{state['kind']!r}。")

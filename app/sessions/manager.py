@@ -48,6 +48,10 @@ class SessionNotFound(KeyError):
     """会话不存在。"""
 
 
+class SessionFrozenError(RuntimeError):
+    """会话已冻结为只读（旧口径遗忘因子会话），拒绝新的快拍追加。"""
+
+
 class Session:
     def __init__(self, meta: SessionMeta, store: FileStore):
         self.meta = meta
@@ -95,6 +99,13 @@ class Session:
                     "total_snapshots": self.acc.total_snapshots,
                     "n_effective_snapshots": float(self.acc.n_eff),
                 }
+            if not self.acc.accepts_appends:
+                raise SessionFrozenError(
+                    f"会话 {sid} 是升级前按旧口径（按批遗忘 v1）累积的遗忘"
+                    f"因子会话，已冻结为只读：历史状态与结果保留可读，但不"
+                    f"再接受新的快拍追加。请新建会话（按快拍遗忘 v2）继续"
+                    f"推送数据。"
+                )
             accepted = self.acc.add_batch(X)
             self.batch_ids.add(batch_id)
             self._persist_state()
@@ -139,6 +150,7 @@ class Session:
                 "created_at": time.time(),
                 "batch_count": len(self.batch_ids),
                 "total_snapshots": self.acc.total_snapshots,
+                "update_rule": self.acc.rule,
                 "config_used": {
                     "source_mode": _jsonable(cfg.source_mode),
                     "angle_min": cfg.angle_min,
@@ -183,6 +195,8 @@ class Session:
             latest = self.latest()
             return {
                 **self.meta.to_dict(),
+                "update_rule": self.acc.rule,
+                "update_frozen": not self.acc.accepts_appends,
                 "n_total_snapshots": self.acc.total_snapshots,
                 "n_effective_snapshots": float(self.acc.n_eff),
                 "n_batches": len(self.batch_ids),

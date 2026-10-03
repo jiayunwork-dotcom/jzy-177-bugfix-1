@@ -1,8 +1,9 @@
 """人读错误的统一 HTTP 出口。
 
 业务异常（阵列几何、协方差、估计、会话/存储问题）统一回
-``400``（会话不存在回 ``404``），JSON 体为
-``{"error": {"type": ..., "message": ...}}``，消息直接面向使用者。
+``400``（会话不存在回 ``404``，旧口径冻结会话的追加回 ``409``），
+JSON 体为 ``{"error": {"type": ..., "message": ...}}``，消息直接
+面向使用者。
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from ..doa.covariance import CovarianceError
 from ..doa.engine import EstimationError
 from ..doa.geometry import GeometryError
 from ..doa.synthesis import SynthesisError
-from ..sessions.manager import SessionNotFound
+from ..sessions.manager import SessionFrozenError, SessionNotFound
 from ..sessions.storage import StorageError
 
 
@@ -69,3 +70,7 @@ def install_exception_handlers(app: FastAPI) -> None:
                 }
             },
         )
+
+    @app.exception_handler(SessionFrozenError)
+    async def _frozen(_: Request, exc: SessionFrozenError) -> JSONResponse:
+        return _detail(exc, 409, "session_frozen")
