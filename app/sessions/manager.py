@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,8 @@ from ..doa.covariance import (
     accumulator_from_state,
     build_accumulator,
 )
+from ..doa.covariance import RULE_FORGETTING, RULE_FORGETTING_LEGACY
+from ..doa.covariance import RULE_SLIDING
 from ..doa.engine import (
     EstimateConfig,
     EstimationError,
@@ -33,6 +36,7 @@ from ..doa.engine import (
 from ..doa.geometry import GeometryError, ULA
 from .models import (
     ArraySpec,
+    CONFIG_VERSION,
     EstimateSpec,
     SessionMeta,
     UpdateSpec,
@@ -48,6 +52,10 @@ class SessionNotFound(KeyError):
     """会话不存在。"""
 
 
+class SessionFrozenError(RuntimeError):
+    """旧口径会话已冻结为只读，拒绝追加。"""
+
+
 class Session:
     def __init__(self, meta: SessionMeta, store: FileStore):
         self.meta = meta
@@ -56,6 +64,22 @@ class Session:
         self.array: ULA = meta.array.build()
         self.acc: Accumulator | None = None
         self.batch_ids: set[str] = set()
+
+    # ---- 口径标记（不依赖协方差状态加载，状态接口直接可读） ----
+    @property
+    def rule(self) -> str:
+        """该会话当前按哪种规则累积（见 doa.covariance.RULE_*）。"""
+        rule = self.meta.update.rule
+        if rule is not None:
+            return rule
+        # 理论上恢复时都会补标记；兜底按方法推断
+        return (RULE_FORGETTING_LEGACY
+                if self.meta.update.method == "forgetting" else RULE_SLIDING)
+
+    @property
+    def append_frozen(self) -> bool:
+        """True：旧口径升级后冻结为只读，不可继续追加。"""
+        return self.rule == RULE_FORGETTING_LEGACY
 
     # ---- 状态装载/恢复 ----
     def _load_state_if_needed(self) -> None:
@@ -86,6 +110,12 @@ class Session:
         sid = self.meta.session_id
         with self.lock:
             self._load_state_if_needed()
+            if self.acc.append_frozen:
+                raise SessionFrozenError(
+                    f"会话 {sid} 按升级前的旧遗忘因子口径（"
+                    f"{self.acc.rule}）累积，已冻结为只读：历史状态与结果"
+                    f"可继续查询，但不能再追加快拍；如需继续采集请新建会话。"
+                )
             if batch_id in self.batch_ids:
                 return {
                     "session_id": sid,
@@ -183,6 +213,8 @@ class Session:
             latest = self.latest()
             return {
                 **self.meta.to_dict(),
+                "accumulation_rule": self.acc.rule,
+                "append_frozen": bool(self.acc.append_frozen),
                 "n_total_snapshots": self.acc.total_snapshots,
                 "n_effective_snapshots": float(self.acc.n_eff),
                 "n_batches": len(self.batch_ids),
@@ -205,12 +237,30 @@ class SessionManager:
         self._recover_all()
 
     def _recover_all(self) -> None:
-        """启动时扫描数据目录，把已有会话元数据装入内存（状态懒加载）。"""
+        """启动时扫描数据目录，把已有会话元数据装入内存（状态懒加载）。
+
+        升级迁移：v1 配置里没有累积口径标记。滑动窗口口径从未变化，直接
+        补记为当前规则；遗忘因子会话标记为旧口径（按批次等权）并冻结为
+        只读。标记只改 config.json（原子重写），state.npz 与
+        results.jsonl 原样保留，历史结果逐字节可读。
+        """
         for sid in self.store.list_sessions():
             try:
-                meta = SessionMeta.from_dict(self.store.load_config(sid))
+                raw = self.store.load_config(sid)
+                meta = SessionMeta.from_dict(raw)
             except (KeyError, ValueError, OSError):  # pragma: no cover
                 continue
+            if int(raw.get("version", 1)) < CONFIG_VERSION:
+                rule = (RULE_FORGETTING_LEGACY
+                        if meta.update.method == "forgetting" else RULE_SLIDING)
+                meta = replace(
+                    meta,
+                    update=replace(meta.update, rule=rule),
+                )
+                # 只写配置（带新口径标记和版本号）；状态与结果绝不触碰。
+                self.store.save_config(
+                    sid, {**meta.to_dict(), "version": CONFIG_VERSION}
+                )
             sess = Session(meta, self.store)
             self._sessions[sid] = sess
 
@@ -227,6 +277,10 @@ class SessionManager:
             )
         update = update or UpdateSpec()
         estimate = estimate or EstimateSpec()
+        # 新建会话总是显式携带当前累积口径
+        current_rule = (RULE_FORGETTING if update.method == "forgetting"
+                        else RULE_SLIDING)
+        update = replace(update, rule=current_rule)
         # 让更新器/估计配置的参数校验也尽早失败
         build_accumulator(ula.m, update.method, update.window, update.alpha)
         EstimateConfig(

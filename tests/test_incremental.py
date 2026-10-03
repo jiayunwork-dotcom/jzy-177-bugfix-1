@@ -59,17 +59,82 @@ def test_sliding_window_matches_windowed_batch():
 
 
 def test_forgetting_incremental_matches_one_shot():
+    """遗忘因子：分批增量结果与“全部快拍按条加权一次算”逐元素一致。"""
     rng = np.random.default_rng(7)
     alpha = 0.9
     batches = [(rng.standard_normal((M, k)) +
                 1j * rng.standard_normal((M, k))) / np.sqrt(2)
                for k in (1, 5, 2, 11, 3, 1)]
+    X = np.concatenate(batches, axis=1)
     acc = ForgettingAccumulator(M, alpha=alpha)
     for b in batches:
         acc.add_batch(b)
-    C_ref, n_ref = forgetting_covariance(batches, alpha)
+    C_ref, n_ref = forgetting_covariance(X, alpha)
     assert abs(acc.n_eff - n_ref) < n_ref * 1e-12
     assert np.allclose(acc.C, C_ref, rtol=RTOL, atol=1e-14)
+
+
+def test_forgetting_independent_of_packetization():
+    """同一份快拍任意切分（整块/16 条包/逐条），C 与 n_eff 严格同口径。"""
+    rng = np.random.default_rng(77)
+    alpha = 0.98
+    X = (rng.standard_normal((M, 600)) +
+         1j * rng.standard_normal((M, 600))) / np.sqrt(2)
+
+    def run(sizes):
+        acc = ForgettingAccumulator(M, alpha=alpha)
+        pos = 0
+        for k in sizes:
+            acc.add_batch(X[:, pos:pos + k])
+            pos += k
+        assert pos == 600
+        return acc.C, acc.n_eff
+
+    sizes_16 = [16] * (600 // 16) + [600 % 16]
+    C_ref, n_ref = forgetting_covariance(X, alpha)
+    for sizes in ([600], sizes_16, [1] * 600,
+                  [37, 200, 213, 150]):
+        C, n = run(sizes)
+        assert abs(n - n_ref) < n_ref * 1e-12
+        assert np.allclose(C, C_ref, rtol=1e-12, atol=1e-14)
+
+
+def test_forgetting_matches_explicit_numpy_weights():
+    """增量结果与调用方在外部按定义直接写出的 NumPy 权重和吻合（1e-9）。"""
+    rng = np.random.default_rng(31)
+    alpha = 0.98
+    X = (rng.standard_normal((M, 600)) +
+         1j * rng.standard_normal((M, 600))) / np.sqrt(2)
+    acc = ForgettingAccumulator(M, alpha=alpha)
+    acc.add_batch(X[:, :300])
+    acc.add_batch(X[:, 300:])  # 中途换批次边界
+    # 最新一条权重 1，往前每条乘 alpha
+    w = alpha ** np.arange(600, dtype=np.float64)[::-1]
+    C_ref = (X * w) @ X.conj().T / w.sum()
+    C_ref = hermitianize(C_ref)
+    rel = np.linalg.norm((acc.C - C_ref).ravel()) \
+        / np.linalg.norm(C_ref.ravel())
+    assert rel < 1e-9
+    assert abs(acc.n_eff - w.sum()) / w.sum() < 1e-12
+
+
+def test_forgetting_alpha_half_huge_batch_no_nan():
+    """alpha=0.5、单批 10000 条的极端配置不出 NaN/除零，C 仍是合法协方差。"""
+    rng = np.random.default_rng(2)
+    X = (rng.standard_normal((M, 10_000)) +
+         1j * rng.standard_normal((M, 10_000))) / np.sqrt(2)
+    acc = ForgettingAccumulator(M, alpha=0.5)
+    acc.add_batch(X)
+    assert np.all(np.isfinite(acc.C))
+    assert acc.n_eff > 1.0
+    eig = np.linalg.eigvalsh(acc.C)
+    assert np.all(np.isfinite(eig)) and eig[0] >= -1e-12
+    C_ref, n_ref = forgetting_covariance(X, 0.5)
+    assert np.allclose(acc.C, C_ref, rtol=1e-12, atol=1e-14)
+    assert abs(acc.n_eff - n_ref) < 1e-12
+    # 继续追加也不出 NaN
+    acc.add_batch(X[:, :100])
+    assert np.all(np.isfinite(acc.C)) and acc.n_eff > 0
 
 
 def test_forgetting_state_roundtrip_preserves_covariance():

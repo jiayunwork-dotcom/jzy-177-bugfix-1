@@ -25,7 +25,7 @@
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                 # 47 项测试，逐条核对验收关系
+python -m pytest                 # 65 项测试，逐条核对验收关系
 uvicorn app.api.main:app --port 8000
 # 或：python -m app
 ```
@@ -71,7 +71,15 @@ POST /sessions
 ```
 
 指数遗忘因子：`"update": {"method": "forgetting", "alpha": 0.9922}`
-（`0.9922 = (256-1)/(256+1)`，与 W=256 等效记忆）。
+（`0.9922 = (256-1)/(256+1)`，与 W=256 等效记忆）。遗忘权重**按快拍**
+计算：最新一条权重 1、往前每条乘 α——整块推、切成任意大小的包推、逐条推
+结果严格一致（协方差相对误差 1e-12 量级），与分批方式无关。
+
+会话状态里带累积口径：`accumulation_rule` 为 `sliding_window_v1` 或
+`forgetting_snapshot_v2`；升级前创建的旧口径遗忘会话标记为
+`forgetting_batch_v1_legacy`、`append_frozen: true`，历史状态与结果可
+继续只读查询/出估计，但追加返回 `409 session_frozen`，请另开新会话采集
+（详见 `docs/design.md` 第 12 节）。
 
 追加示例（实部虚部各为 M×K 嵌套数组；每批大小不固定，K≤10000）：
 
@@ -161,17 +169,21 @@ results.jsonl  # 每次估计一行，version 从 1 单调递增（只追加，f
 [`experiments/tracking_experiment.py`](experiments/tracking_experiment.py)
 （可复跑，结果 JSON 在 `experiments/results/`）。**默认定长滑动窗口
 W=256**：阶跃后约 0.56W（≈144 条快拍）跟上，稳态 RMSE 约 0.024°，且
-跟拍速度与阶跃前历史长度无关；遗忘因子省内存、稳态精度略好，但旧数据
-几何拖尾，长时间运行后阶跃跟拍要 ~4.6W。两种方式都完整支持。
+跟拍速度与阶跃前历史长度无关；遗忘因子按快拍几何加权、省内存，等效记忆
+下跟拍更快（α=.9922 约 0.38W/96 条）、稳态精度与滑动相当。两种方式都
+完整支持。
 
 ## 测试
 
 ```bash
-python -m pytest -q          # 47 passed
+python -m pytest -q          # 65 passed
 ```
 
 统计类用例全部固定随机种子，覆盖：高 SNR 偏差 <0.1°、复标量不变性、
 栅瓣角度对、方位变号、相干源平滑前后对比、SNR 0→20 dB 的 RMSE 与
 3×CRB、高 SNR 下 MDL 源数、整批/分批估计一致、增量协方差对一次性定义
-的 1e-12 对齐与长程厄米性、批次幂等、并发串行等价、会话隔离、重启
-恢复、版本轮询、SSE 推送、全部人读错误与规模上限。
+的 1e-12 对齐与长程厄米性、遗忘因子三种分包方式（整块/16 条/逐条）
+结果一致且与外部 NumPy 按定义计算的协方差在 1e-9 内吻合、α=0.5 单批
+10000 条无 NaN/除零、批次幂等、并发串行等价、会话隔离、重启恢复与重启
+后续追加、版本轮询、SSE 推送、升级前旧数据目录真实启动后的冻结只读与
+历史逐字保留、全部人读错误与规模上限。

@@ -13,8 +13,9 @@ from typing import Any
 import numpy as np
 
 from ..doa.geometry import ULA
+from ..doa.covariance import RULE_FORGETTING, RULE_SLIDING
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -55,11 +56,16 @@ class UpdateSpec:
     window: sliding 模式窗口长度，默认 256。
     alpha: forgetting 模式遗忘因子，默认 0.9922（与 W=256 等效记忆
         alpha=(W-1)/(W+1)）。
+    rule: 该会话实际遵循的累积口径标识（见 doa.covariance.RULE_*）。
+        forgetting 旧版曾按“批次等权、批间乘 alpha”累积（分包相关），
+        升级后按快拍加权；旧会话载入时被标成 legacy 并冻结。仅历史
+        配置会出现 legacy/None；新建会话总是显式写入当前口径。
     """
 
     method: str = "sliding"
     window: int = 256
     alpha: float = 0.9922
+    rule: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -70,6 +76,7 @@ class UpdateSpec:
             method=str(d.get("method", "sliding")),
             window=int(d.get("window", 256)),
             alpha=float(d.get("alpha", 0.9922)),
+            rule=(None if d.get("rule") is None else str(d.get("rule"))),
         )
 
 

@@ -13,7 +13,7 @@ from ..doa.covariance import CovarianceError
 from ..doa.engine import EstimationError
 from ..doa.geometry import GeometryError
 from ..doa.synthesis import SynthesisError
-from ..sessions.manager import SessionNotFound
+from ..sessions.manager import SessionFrozenError, SessionNotFound
 from ..sessions.storage import StorageError
 
 
@@ -66,6 +66,18 @@ def install_exception_handlers(app: FastAPI) -> None:
                 "error": {
                     "type": "session_not_found",
                     "message": f"会话 {exc.args[0]!r} 不存在。",
+                }
+            },
+        )
+
+    @app.exception_handler(SessionFrozenError)
+    async def _frozen(_: Request, exc: SessionFrozenError) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "type": "session_frozen",
+                    "message": str(exc),
                 }
             },
         )
